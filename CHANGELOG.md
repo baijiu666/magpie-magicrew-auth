@@ -1,5 +1,39 @@
 # 更新记录
 
+## 0.3.12
+
+**纯协议发消息 —— 签到自动完成「第一次 AI 工作」，全程不开浏览器**
+
+之前是拉一个 Chrome、用 CDP 点输入框。能跑，但重、脆、还要有登录态。
+这次把协议本身摸清了，**直接发 Socket.IO 帧**：
+
+```
+连接  wss://<host>/socket.io/?EIO=3&transport=websocket
+登录  42/im,<ns>["login",{context:{authorization:JWT, organization_code, language:"zh_CN"}}]
+聊天  42/im,<ns>["chat",{context:{…},data:{message:{…},conversation_id}}]
+     → 43/im,<ns>[{code:1000,…}]
+```
+
+五个关键点（都在 `src/chat-task.mjs` 顶上）：
+
+1. **鉴权在消息体里**（`context.authorization` = JWT），握手头不带 token ——
+   所以不需要浏览器登录态、不需要 Cookie。
+   这是「注入凭据」「复制 profile」两条路都走不通之后打开的另一扇门。
+2. **不需要先发 `40` CONNECT**，直接 `42` 事件就能被受理。
+3. `<ns>` 是客户端自己生成的唯一数字（浏览器用 `Date.now()`），给不重复的即可。
+4. `data.conversation_id` 必须非空 —— 空着回 **3007**。
+5. `message.topic_id` 要用话题的 **chat_topic_id**，
+   **不是** `project.current_topic_id`（用后者回 **3016 话题未找到**）。
+
+实测：建项目 → 取话题 → 发一条，**1 秒完成**，AI 正常回复。
+
+```
+[0s] 挑选模型… [0s] 定位项目… [0s] 建一个话题… [1s] 发送消息…
+结果: { ok: true, messageId: "973961616596418560", replies: 1, model: "Qwen3.5 Flash" }
+```
+
+连带撤掉 `src/auto-task.mjs`（浏览器版），签到里只留纯协议这一条路。
+
 ## 0.3.11
 
 **签到接管「完成第一次 AI 工作」—— 不再单开一个按钮**
