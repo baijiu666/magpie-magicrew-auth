@@ -198,9 +198,32 @@ export async function createTopic(jwt, org, host, projectId, name = pickName()) 
  *
  * @returns {{ok:boolean, messageId?:string, replies?:number, reason?:string}}
  */
+/**
+ * 纯协议发一条消息 —— **不开浏览器**。
+ *
+ * 消息走 Socket.IO（Engine.IO v3），2026-10-27 抓包实测：
+ *
+ *   42/im,<ns>["login",{context:{…}}]            → 43/im,<ns>[{code:1000,…user}]
+ *   42/im,<ns>["chat", {context:{…},data:{…}}]    → 43/im,<ns>[{code:1000,…seq}]
+ *
+ * 五个关键点（踩过的坑都在这）：
+ *   1. **鉴权在消息体里**（context.authorization = JWT），握手头不带 token。
+ *      所以不需要浏览器登录态、不需要 Cookie —— 这就是能纯协议直发的原因。
+ *   2. **不需要先发 `40` CONNECT**，直接 `42` 事件就能被受理。
+ *   3. `<ns>` 是客户端自己生成的唯一数字（浏览器用 Date.now()），随便给不重复的即可。
+ *   4. `data.conversation_id` 必须非空 —— 空着服务端回 **3007**。
+ *   5. `message.topic_id` 要用话题的 **chat_topic_id**，
+ *      **不是** project.current_topic_id（用后者回 **3016 话题未找到**）。
+ *
+ * @returns {Promise<{ok:boolean, messageId?:string, reason?:string}>}
+ */
 export async function sendChat(jwt, org, host, { topicId, conversationId, text = PICK_TEXT, model }) {
+  if (!topicId || !conversationId) {
+    return { ok: false, reason: "缺少 topicId / conversationId" }
+  }
+
   const origin = host.includes("magicrew") ? "https://www.magicrew.ai" : "https://www.letsmagic.cn"
-  const sock = await openSocket(host.replace(/^https?:\/\//, ""), origin)
+  const bare = host.replace(/^https?:\/\//, "").replace(/\/$/, "")
   const ns = String(Date.now())
   const appMsgId = `${Math.random().toString(36).slice(2, 10)}-${Math.random().toString(36).slice(2, 14)}`
   const ctx = () => ({
@@ -210,23 +233,68 @@ export async function sendChat(jwt, org, host, { topicId, conversationId, text =
     language: "zh_CN",
     signature: "",
   })
+  const m = model || { model_id: "qwen3.5-flash", model_name: "Qwen3.5 Flash", model_icon: "" }
+
+  let ws
+  try {
+    ws = new WebSocket(`wss://${bare}/socket.io/?EIO=3&transport=websocket&timestamp=${Date.now()}`, {
+      headers: { Origin: origin },
+    })
+  } catch (e) {
+    return { ok: false, reason: `WebSocket 建连失败：${String(e?.message ?? e)}` }
+  }
+
+  const queue = []
+  let closed = false
+  ws.addEventListener("message", (ev) => {
+    const d = String(ev.data || "")
+    // Engine.IO ping → pong
+    if (d === "2") { try { ws.send("3") } catch {} ; return }
+    queue.push(d)
+  })
+  ws.addEventListener("close", () => { closed = true })
+  ws.addEventListener("error", () => { closed = true })
+
+  const next = async (pred, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && !closed) {
+      const i = queue.findIndex(pred)
+      if (i >= 0) return queue.splice(i, 1)[0]
+      await sleep(120)
+    }
+    return null
+  }
 
   try {
-    // ① 登录
-    sock.ws.send(
+    // ① 等连上
+    const opened = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(false), 15_000)
+      ws.addEventListener("open", () => { clearTimeout(t); resolve(true) }, { once: true })
+      ws.addEventListener("error", () => { clearTimeout(t); resolve(false) }, { once: true })
+    })
+    if (!opened) return { ok: false, reason: "WebSocket 连接超时" }
+
+    // ② 登录
+    ws.send(
       `42/im,${ns}` +
         JSON.stringify([
           "login",
-          { context: ctx(), data: { message: { type: "text", text: { content: "登录" }, app_message_id: "WEB-" + appMsgId }, conversation_id: "" } },
+          {
+            context: ctx(),
+            data: {
+              message: { type: "text", text: { content: "登录" }, app_message_id: `WEB-${appMsgId}` },
+              conversation_id: "",
+            },
+          },
         ]),
     )
-    const loginAck = await sock.next((d) => d.startsWith(`43/im,${ns}`), 20_000)
-    if (!loginAck) return { ok: false, reason: "登录无响应" }
+    const loginAck = await next((d) => d.startsWith(`43/im,${ns}`), 20_000)
+    if (!loginAck) return { ok: false, reason: "登录没有回包" }
     const la = JSON.parse(loginAck.slice(`43/im,${ns}`.length))?.[0] || {}
     if (la.code !== 1000) return { ok: false, reason: `登录失败：${la.message}（code ${la.code}）` }
     const senderId = String(la.data?.user?.user_id ?? "")
 
-    // ② 发消息
+    // ③ 发消息
     const richText = JSON.stringify({
       type: "doc",
       content: [
@@ -237,8 +305,7 @@ export async function sendChat(jwt, org, host, { topicId, conversationId, text =
         },
       ],
     })
-    const m = model || { model_id: "qwen3.5-flash", model_name: "Qwen3.5 Flash", model_icon: "" }
-    sock.ws.send(
+    ws.send(
       `42/im,${ns}` +
         JSON.stringify([
           "chat",
@@ -256,7 +323,7 @@ export async function sendChat(jwt, org, host, { topicId, conversationId, text =
                       chat_mode: "normal",
                       topic_pattern: "general",
                       model: m,
-                      enable_web_search: false,   // 首任务不需要联网，关掉省时间也省钱
+                      enable_web_search: false,
                       image_model: { model_id: "doubao-seedream-5-0-pro", model_name: "Seedream 5.0 Pro", model_icon: "" },
                       dynamic_params: { message_version: "v2" },
                     },
@@ -274,24 +341,27 @@ export async function sendChat(jwt, org, host, { topicId, conversationId, text =
           },
         ]),
     )
-    const chatAck = await sock.next((d) => d.startsWith(`43/im,${ns}`), 25_000)
-    if (!chatAck) return { ok: false, reason: "发送无响应" }
+    const chatAck = await next((d) => d.startsWith(`43/im,${ns}`), 25_000)
+    if (!chatAck) return { ok: false, reason: "发送没有回包" }
     const ca = JSON.parse(chatAck.slice(`43/im,${ns}`.length))?.[0] || {}
     if (ca.code !== 1000) return { ok: false, reason: `发送失败：${ca.message}（code ${ca.code}）` }
 
-    // ③ 等 AI 真的回一条（看到 super_magic_message 就算数），最多 90 秒
-    const deadline = Date.now() + 90_000
+    // ④ 等 AI 回一条（super_magic_message）—— 任务判定看的是这个
     let replies = 0
-    while (Date.now() < deadline) {
-      const f = await sock.next((d) => d.includes(`42/im,["chat"`) || d.includes("super_magic_message") || d.includes("end_conversation_input"), 5_000)
+    const deadline = Date.now() + 90_000
+    while (Date.now() < deadline && !closed) {
+      const f = await next((d) => d.includes("super_magic_message") || d.includes("end_conversation_input"), 5_000)
       if (f && f.includes("super_magic_message")) replies++
       if (replies >= 1) break
     }
     return { ok: true, messageId: String(ca.data?.seq?.seq_id ?? ""), replies }
+  } catch (e) {
+    return { ok: false, reason: String(e?.message ?? e) }
   } finally {
-    sock.close()
+    try { ws.close() } catch {}
   }
 }
+
 
 /**
  * 完整链路：找项目 → 建话题（随机名）→ 挑最便宜的模型 → 发一条消息。
@@ -314,7 +384,37 @@ export async function runChatTask({ jwt, org, host = SITES.cn.host, workspaceId,
   }
 
   onProgress("建一个话题…")
-  const topic = await createTopic(jwt, org, host, projectId, pickName())
+  // 优先复用已有的：话题里的 chat_topic_id / chat_conversation_id 正是发消息要的
+  // （⚠ 不是 project.current_topic_id —— 用它会回 3016「话题未找到」）
+  let topic = null
+  const { list: existing } = await (async () => {
+    try {
+      const r = await fetch(`${host}/api/v1/super-agent/projects/${projectId}/topics`, {
+        headers: {
+          authorization: `Bearer ${jwt}`,
+          "content-type": "application/json",
+          accept: "application/json",
+          origin: host.includes("magicrew") ? "https://www.magicrew.ai" : "https://www.letsmagic.cn",
+          "organization-code": org,
+        },
+      })
+      const b = await r.json()
+      return b?.data ?? { list: [] }
+    } catch {
+      return { list: [] }
+    }
+  })()
+  const usable = (existing || []).find((t) => t.chat_topic_id && t.chat_conversation_id)
+  if (usable) {
+    topic = {
+      name: usable.topic_name || "(已有话题)",
+      topicId: String(usable.chat_topic_id),
+      conversationId: String(usable.chat_conversation_id),
+    }
+  } else {
+    const created = await createTopic(jwt, org, host, projectId, pickName())
+    topic = { name: created.name, topicId: created.topicId, conversationId: created.conversationId }
+  }
 
   onProgress("发送消息…")
   const r = await sendChat(jwt, org, host, {
