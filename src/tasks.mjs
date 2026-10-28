@@ -20,7 +20,7 @@
 //
 // 每天跑一次，两步都做，任一步失败不影响另一步。
 
-import { fetchPoints, claimLoginGift, fetchOnboardingTasks, completeOnboardingTask, fetchFirstWorkspaceId } from "./api.mjs"
+import { fetchPoints, claimLoginGift, fetchOnboardingTasks, completeOnboardingTask, fetchFirstWorkspaceId, fetchProjectTopics } from "./api.mjs"
 import { sentToday, noteAutoChat } from "./store.mjs"
 
 /** 站点 id —— 去重标记按站点分文件存 */
@@ -244,9 +244,21 @@ async function autoFirstChat(h) {
     const wsId = await fetchFirstWorkspaceId(h.jwt, h.org, h.host).catch(() => "")
     if (!wsId) return { reason: "这个账号还没有工作区，先在网页里进一次" }
 
+    // ── 判据：**有没有话题**，不是有没有项目 ──────────────────────────
+    //
+    // 项目在打开工作台时就会自动建，建了项目却一句话没说很常见（新号就是）。
+    // 而邀请奖励要的是「被邀请人完成首个任务或对话」—— 落到国际站就是
+    // **真的发过一条消息**，也就是有过一个话题。
+    //
+    // 拿项目 -> 列它的话题：有话题 = 说过话，跳过；没话题 = 得补一条。
     const { findProjectId, runChatTask } = await import("./chat-task.mjs")
-    const existing = await findProjectId(h.jwt, h.org, h.host, wsId).catch(() => "")
-    if (existing) return { skipped: true }
+    const pid = await findProjectId(h.jwt, h.org, h.host, wsId).catch(() => "")
+    if (pid) {
+      const topics = await fetchProjectTopics(h.jwt, h.org, pid, h.host).catch(() => [])
+      if (topics.length > 0) {
+        return { skipped: true, reason: `已有 ${topics.length} 个话题，说明发过消息` }
+      }
+    }
 
     const r = await runChatTask({ jwt: h.jwt, org: h.org, host: h.host, workspaceId: wsId })
     if (!r.ok) return { reason: r.reason || "发送失败" }
